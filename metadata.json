@@ -1,0 +1,6 @@
+{
+  "name": "VibeScribe - Audio & Video Transcription Studio",
+  "description": "Professional speech-to-text with local GPU & cloud AI models, live dictation, speaker diarization, timestamps, subtitles, and smart model advisor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
