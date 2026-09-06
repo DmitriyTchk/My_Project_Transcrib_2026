@@ -2,9 +2,10 @@
 FROM node:20-bookworm AS build
 WORKDIR /app
 
-# Сначала только манифесты — для эффективного кэширования слоёв
-COPY package.json package-lock.json ./
-RUN npm ci
+# Сначала только манифесты — для эффективного кэширования слоёв.
+# package-lock.json может отсутствовать в репозитории — тогда ставим по package.json.
+COPY package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 # Копируем исходники и собираем (vite build + esbuild server.ts -> server.js)
 COPY . .
@@ -22,8 +23,8 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 # Только production-зависимости
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
 # Собранный фронтенд и серверный бандл из stage 1
 COPY --from=build /app/dist ./dist
