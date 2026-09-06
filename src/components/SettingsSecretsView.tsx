@@ -468,7 +468,7 @@ export const SettingsSecretsView: React.FC<SettingsSecretsViewProps> = ({
                 </div>
                 <div className="text-[11px] text-zinc-500 space-y-1">
                   <p>• Требования: установленные NVIDIA Drivers и NVIDIA Container Toolkit.</p>
-                  <p>• Для выбора конкретной модели (например, large-v3-turbo) добавьте флаг: <code className="bg-zinc-200 dark:bg-zinc-800 px-1 py-0.5 rounded font-mono">-e WHISPER__MODEL=deepdml/faster-whisper-large-v3-turbo-ct2</code></p>
+                  <p>• Рекомендуемая модель — large-v3 (модель deepdml/faster-whisper-large-v3-turbo-ct2 вызывает ошибку ValueError в faster-whisper и не поддерживается). Добавьте флаги: <code className="bg-zinc-200 dark:bg-zinc-800 px-1 py-0.5 rounded font-mono">-e WHISPER__MODEL=large-v3 -e WHISPER__API_KEY=my-secret-token</code></p>
                 </div>
               </div>
             )}

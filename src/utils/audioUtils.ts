@@ -115,6 +115,84 @@ async function dataUrlToBlob(dataUrl: string): Promise<Blob> {
 }
 
 /**
+ * Финальный fallback: вернуть исходный файл одним фрагментом, если все методы нарезки не сработали
+ */
+function singleFileFallback(file: File): { chunks: AudioChunk[]; totalDuration: number } {
+  return {
+    chunks: [
+      {
+        index: 0,
+        totalChunks: 1,
+        startTime: 0,
+        duration: 60,
+        blob: file,
+        mimeType: file.type || 'audio/mp3',
+      },
+    ],
+    totalDuration: 60,
+  };
+}
+
+/**
+ * Серверная нарезка файла через прямую бинарную загрузку (POST /api/prepare-chunks).
+ * Файл отправляется сырым бинарным телом БЕЗ base64 и НЕ читается в память браузера —
+ * это единственный безопасный способ обработать файлы в сотни мегабайт и больше.
+ * При ошибке выбрасывает исключение (обработку fallback выполняет вызывающий код).
+ */
+async function splitViaServerPrepareChunks(
+  file: File,
+  chunkDurationSeconds: number,
+  onProgress?: (msg: string) => void
+): Promise<{ chunks: AudioChunk[]; totalDuration: number }> {
+  if (onProgress) {
+    onProgress('Отправка файла на локальный сервер для нарезки (без загрузки в память браузера)...');
+  }
+
+  // 1. Загружаем файл на сервер сырым бинарным телом (стриминг на диск на стороне сервера)
+  const resp = await fetch(`/api/prepare-chunks?chunkDurationSeconds=${chunkDurationSeconds}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: file,
+  });
+
+  if (!resp.ok) {
+    const errJson = await resp.json().catch(() => ({}));
+    throw new Error(errJson.error || `HTTP ${resp.status}: Ошибка серверной нарезки файла`);
+  }
+
+  const { jobId, totalChunks, totalDuration } = await resp.json();
+
+  // 2. Последовательно забираем готовые фрагменты с сервера
+  const chunks: AudioChunk[] = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkResp = await fetch(`/api/prepare-chunks/${jobId}/${i}`);
+    if (!chunkResp.ok) {
+      const errJson = await chunkResp.json().catch(() => ({}));
+      throw new Error(errJson.error || `HTTP ${chunkResp.status}: Не удалось загрузить фрагмент ${i + 1}`);
+    }
+    const sc = await chunkResp.json();
+    const blob = await dataUrlToBlob(sc.audioBase64);
+    chunks.push({
+      index: sc.index,
+      totalChunks: sc.totalChunks,
+      startTime: sc.startTime,
+      duration: sc.duration,
+      blob,
+      mimeType: 'audio/wav',
+    });
+
+    if (onProgress && ((i + 1) % 5 === 0 || i === totalChunks - 1)) {
+      onProgress(`Загрузка фрагмента ${i + 1} из ${totalChunks}...`);
+    }
+  }
+
+  // 3. Освобождаем временные файлы на сервере (ошибки игнорируем — каталог удалится по TTL)
+  fetch(`/api/prepare-chunks/${jobId}`, { method: 'DELETE' }).catch(() => {});
+
+  return { chunks, totalDuration };
+}
+
+/**
  * Split an audio or video file into small digestible chunks (e.g. 45 seconds each)
  * resampled to 16,000 Hz Mono WAV (approx ~1.4MB each).
  * This completely avoids HTTP 413 (Payload Too Large) and proxy timeout issues.
@@ -126,6 +204,21 @@ export async function splitAudioIntoChunks(
 ): Promise<{ chunks: AudioChunk[]; totalDuration: number }> {
   let audioContext: AudioContext | null = null;
   const isVideo = file.type.startsWith('video/') || /\.(mp4|mkv|mov|avi|webm|ts|m4v)$/i.test(file.name);
+
+  // КРИТИЧНО: для файлов больше 50 МБ браузерное декодирование
+  // (file.arrayBuffer() + AudioContext.decodeAudioData) распаковывает ВЕСЬ файл в PCM
+  // в памяти вкладки: лекция на 1+ ГБ превращается в десятки ГБ RAM, и вкладка падает
+  // с Out of Memory ДО того, как сработает блок catch. Поэтому большие файлы сразу
+  // отправляем на серверную нарезку — файл уходит сырым бинарным потоком и в память
+  // браузера не загружается вообще.
+  if (file.size > 50 * 1024 * 1024) {
+    try {
+      return await splitViaServerPrepareChunks(file, chunkDurationSeconds, onProgress);
+    } catch (bigFileErr) {
+      console.error('Server-side splitting of a large file failed, fallback to single file:', bigFileErr);
+      return singleFileFallback(file);
+    }
+  }
 
   // Method A: In-Browser Web Audio API Fast Resampling
   try {
@@ -186,59 +279,13 @@ export async function splitAudioIntoChunks(
     console.warn('In-browser audio decoding failed, using server-side FFmpeg extraction:', browserDecodeErr);
 
     // Method B: Server-Side FFmpeg Audio Extraction & Chunking Fallback
+    // Файл отправляется сырым бинарным телом на /api/prepare-chunks (стриминг на диск),
+    // без base64 и без лимита тела запроса express.json.
     try {
-      if (onProgress) {
-        onProgress('Извлечение аудиодорожки через серверный медиа-движок FFmpeg...');
-      }
-
-      const fileBase64 = await fileToBase64(file);
-      const resp = await fetch('/api/extract-audio-chunks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fileBase64,
-          chunkDurationSeconds,
-        }),
-      });
-
-      if (!resp.ok) {
-        const errJson = await resp.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP ${resp.status}: Ошибка извлечения аудио`);
-      }
-
-      const data = await resp.json();
-      const serverChunks = data.chunks || [];
-      const totalDuration = data.totalDuration || 60;
-
-      const chunks: AudioChunk[] = [];
-      for (const sc of serverChunks) {
-        const blob = await dataUrlToBlob(sc.audioBase64);
-        chunks.push({
-          index: sc.index,
-          totalChunks: sc.totalChunks,
-          startTime: sc.startTime,
-          duration: sc.duration,
-          blob,
-          mimeType: 'audio/wav',
-        });
-      }
-
-      return { chunks, totalDuration };
+      return await splitViaServerPrepareChunks(file, chunkDurationSeconds, onProgress);
     } catch (serverExtractErr) {
       console.error('All audio splitting methods failed, fallback to single file:', serverExtractErr);
-      return {
-        chunks: [
-          {
-            index: 0,
-            totalChunks: 1,
-            startTime: 0,
-            duration: 60,
-            blob: file,
-            mimeType: file.type || 'audio/mp3',
-          },
-        ],
-        totalDuration: 60,
-      };
+      return singleFileFallback(file);
     }
   } finally {
     if (audioContext && audioContext.state !== 'closed') {
@@ -449,7 +496,8 @@ export async function transcribeDirectToLocalServer(
 
   const formData = new FormData();
   formData.append('file', audioBlob, fileName.replace(/\.[^/.]+$/, '') + '.wav');
-  formData.append('model', modelId || 'deepdml/faster-whisper-large-v3-turbo-ct2');
+  // На локальном сервере физически загружена large-v3 (deepdml/*-turbo-ct2 вызывает ValueError в faster-whisper)
+  formData.append('model', modelId || 'large-v3');
   if (language && language !== 'auto') {
     formData.append('language', language);
   }
