@@ -1655,6 +1655,7 @@ async function setupVite() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
+}
 
 setupVite().catch((err) => {
   console.error('Failed to start server:', err);
