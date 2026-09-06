@@ -2,6 +2,7 @@ import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 
@@ -19,6 +20,11 @@ const ai = new GoogleGenAI({
     },
   },
 });
+
+// Настройки локального Whisper-сервера: берутся из окружения, если клиент не передал свои значения
+const LOCAL_WHISPER_ENDPOINT =
+  process.env.LOCAL_WHISPER_ENDPOINT || 'http://localhost:8000/v1/audio/transcriptions';
+const LOCAL_WHISPER_API_KEY = process.env.LOCAL_WHISPER_API_KEY || '';
 
 // Support large audio/video payloads (up to 250MB)
 app.use(express.json({ limit: '250mb' }));
@@ -111,7 +117,8 @@ app.post('/api/secrets/save', (req, res) => {
 // 3. Test Local Backend Endpoint
 app.post('/api/local-engine/test', async (req, res) => {
   const { endpoint, apiKey } = req.body;
-  let rawUrl = (endpoint || 'http://localhost:8000/v1/audio/transcriptions').trim();
+  let rawUrl = (endpoint || LOCAL_WHISPER_ENDPOINT).trim();
+  const effectiveApiKey = apiKey || LOCAL_WHISPER_API_KEY;
 
   // Normalize URL: extract base host
   let baseUrl = rawUrl;
@@ -205,10 +212,44 @@ app.post('/api/local-engine/test', async (req, res) => {
     status: lastStatus || 500,
     message: lastStatus === 401
       ? 'Локальный сервер вернул HTTP 401 (Требуется токен авторизации). Укажите API-ключ в настройках.'
-      : 'Не удалось подключиться к серверу. Если используете localtunnel, убедитесь что туннель не закрылся.',
+      : 'Не удалось подключиться к серверу. Убедитесь, что локальный Whisper-сервер запущен (например, docker start faster-whisper-server или start-whisper.bat) и порт 8000 доступен. Если сервер находится на другой машине, можно использовать туннель (localtunnel/ngrok) — проверьте, что он активен.',
     error: lastError,
   });
 });
+
+// Стандартный 44-байтовый WAV-заголовок для 16-битного моно PCM 16 кГц
+function createPcmWavHeader(dataLen: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(44 + dataLen - 8, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // Mono
+  header.writeUInt32LE(16000, 24); // SampleRate
+  header.writeUInt32LE(32000, 28); // ByteRate (16000 * 1 * 2)
+  header.writeUInt16LE(2, 32); // BlockAlign
+  header.writeUInt16LE(16, 34); // BitsPerSample
+  header.write('data', 36);
+  header.writeUInt32LE(dataLen, 40);
+  return header;
+}
+
+// Находит смещение PCM-данных (чанк 'data') внутри WAV-файла.
+// FFmpeg может дописывать служебные чанки (LIST/INFO), поэтому жёсткое 44 не всегда верно.
+function findWavDataOffset(buf: Buffer): number {
+  if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WAVE') {
+    let off = 12;
+    while (off + 8 <= buf.length) {
+      const id = buf.toString('ascii', off, off + 4);
+      const size = buf.readUInt32LE(off + 4);
+      if (id === 'data') return off + 8;
+      off += 8 + size + (size % 2);
+    }
+  }
+  return 44;
+}
 
 // Helper to ensure any audio or video buffer is a clean 16kHz Mono 16-bit PCM WAV using ffmpeg
 async function ensureClean16kWavBuffer(inputBuffer: Buffer): Promise<Buffer> {
@@ -340,34 +381,30 @@ async function transcribeViaLocalWhisper(params: {
     }
   } catch {}
 
-  // Resolve model mapping based on requested ID
+  // Resolve model mapping based on requested ID.
+  // ВНИМАНИЕ: модель 'deepdml/faster-whisper-large-v3-turbo-ct2' вызывает ValueError в faster-whisper,
+  // поэтому она полностью исключена из кандидатов. Приоритет: модели, реально загруженные
+  // на сервере (discoveredModels), затем large-v3 и её алиасы.
   function getModelCandidates(id?: string): string[] {
     const specific: string[] = [];
     if (id === 'faster-whisper-large-v3-turbo') {
-      specific.push(
-        'deepdml/faster-whisper-large-v3-turbo-ct2',
-        'large-v3-turbo',
-        'openai/whisper-large-v3-turbo',
-        'Systran/faster-whisper-large-v3',
-        'whisper-1'
-      );
+      // На локальном сервере физически загружена large-v3 — сервер сматчит по факту
+      specific.push('large-v3', 'Systran/faster-whisper-large-v3', 'whisper-1');
     } else if (id === 'faster-whisper-large-v3' || id === 'whisperx-large-v3') {
-      specific.push(
-        'Systran/faster-whisper-large-v3',
-        'large-v3',
-        'deepdml/faster-whisper-large-v3-turbo-ct2',
-        'whisper-1'
-      );
+      specific.push('large-v3', 'Systran/faster-whisper-large-v3', 'whisper-1');
     } else if (id === 'faster-whisper-medium') {
-      specific.push('Systran/faster-whisper-medium', 'medium', 'whisper-1');
+      specific.push('medium', 'Systran/faster-whisper-medium', 'whisper-1');
     } else if (id === 'faster-whisper-small') {
-      specific.push('Systran/faster-whisper-small', 'small', 'whisper-1');
+      specific.push('small', 'Systran/faster-whisper-small', 'whisper-1');
     } else if (id) {
-      specific.push(id, 'deepdml/faster-whisper-large-v3-turbo-ct2', 'Systran/faster-whisper-large-v3', 'whisper-1');
+      specific.push(id, 'large-v3', 'Systran/faster-whisper-large-v3', 'whisper-1');
     } else {
-      specific.push('deepdml/faster-whisper-large-v3-turbo-ct2', 'Systran/faster-whisper-large-v3', 'whisper-1');
+      specific.push('large-v3', 'Systran/faster-whisper-large-v3', 'whisper-1');
     }
-    return Array.from(new Set([...discoveredModels, ...specific, 'whisper-1', 'large-v3-turbo', 'large-v3']));
+    // ВАЖНО: запрошенная модель (specific) имеет приоритет над discoveredModels.
+    // /v1/models у faster-whisper-server возвращает ВСЕ известные модели (small, tiny, base, ...),
+    // поэтому брать первую из списка нельзя — иначе вместо large-v3 будет использоваться small.
+    return Array.from(new Set([...specific, ...discoveredModels, 'large-v3', 'Systran/faster-whisper-large-v3', 'whisper-1']));
   }
 
   const modelCandidates = getModelCandidates(requestedModelId);
@@ -544,19 +581,23 @@ app.post('/api/transcribe', async (req, res) => {
       translateToEnglish = false,
     } = options;
 
-    // Handle Local mode proxy if user explicitly requested local server
-    if (engineMode === 'local' && customEndpoint) {
+    // Handle Local mode proxy (прямое локальное подключение; URL/ключ из клиента или из env)
+    if (engineMode === 'local') {
+      const effectiveEndpoint = (customEndpoint || LOCAL_WHISPER_ENDPOINT).trim();
+      const effectiveLocalApiKey = localApiKey || LOCAL_WHISPER_API_KEY;
       try {
-        const buffer = Buffer.from(audioBase64, 'base64');
+        // Срезаем возможный data-URI префикс (data:audio/...;base64,) перед декодированием
+        const cleanLocalBase64 = String(audioBase64).replace(/^data:[^;]+;base64,/, '');
+        const buffer = Buffer.from(cleanLocalBase64, 'base64');
 
         const localResult = await transcribeViaLocalWhisper({
-          customEndpoint,
+          customEndpoint: effectiveEndpoint,
           buffer,
           mimeType: mimeType || 'audio/wav',
           fileName: 'audio.wav',
           requestedModelId: modelId,
           language,
-          localApiKey,
+          localApiKey: effectiveLocalApiKey,
           includeDiarization,
           timeoutMs: 300000,
         });
@@ -620,7 +661,7 @@ app.post('/api/transcribe', async (req, res) => {
       } catch (localErr: any) {
         console.warn('Local engine request error:', localErr.message);
         res.status(502).json({
-          error: `Ошибка локального GPU сервера (${localErr.message}). Проверьте активность окна с localtunnel и нагрузку на видеопамять.`,
+          error: `Ошибка локального GPU сервера (${localErr.message}). Убедитесь, что контейнер faster-whisper запущен (docker ps) и видеопамять не переполнена.`,
         });
         return;
       }
@@ -830,19 +871,21 @@ app.post('/api/transcribe-chunk', async (req, res) => {
 
     const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
 
-    // 1. Local Faster-Whisper GPU Engine
-    if (engineMode === 'local' && customEndpoint) {
+    // 1. Local Faster-Whisper GPU Engine (прямое локальное подключение; URL/ключ из клиента или из env)
+    if (engineMode === 'local') {
+      const effectiveEndpoint = (customEndpoint || LOCAL_WHISPER_ENDPOINT).trim();
+      const effectiveLocalApiKey = localApiKey || LOCAL_WHISPER_API_KEY;
       try {
         const buffer = Buffer.from(cleanBase64, 'base64');
 
         const localResult = await transcribeViaLocalWhisper({
-          customEndpoint,
+          customEndpoint: effectiveEndpoint,
           buffer,
           mimeType: mimeType || 'audio/wav',
           fileName: `chunk_${chunkIndex}.wav`,
           requestedModelId: modelId,
           language,
-          localApiKey,
+          localApiKey: effectiveLocalApiKey,
           includeDiarization: options.includeDiarization,
           timeoutMs: 300000,
         });
@@ -988,25 +1031,7 @@ app.post('/api/extract-audio-chunks', async (req, res) => {
       const chunkDuration = (chunkPcm.length / bytesPerSample) / sampleRate;
 
       // Construct standard WAV header
-      const chunkHeader = Buffer.alloc(44);
-      const dataLen = chunkPcm.length;
-      const fileLen = 44 + dataLen - 8;
-
-      chunkHeader.write('RIFF', 0);
-      chunkHeader.writeUInt32LE(fileLen, 4);
-      chunkHeader.write('WAVE', 8);
-      chunkHeader.write('fmt ', 12);
-      chunkHeader.writeUInt32LE(16, 16);
-      chunkHeader.writeUInt16LE(1, 20); // PCM
-      chunkHeader.writeUInt16LE(1, 22); // Mono
-      chunkHeader.writeUInt32LE(16000, 24); // SampleRate
-      chunkHeader.writeUInt32LE(32000, 28); // ByteRate (16000 * 1 * 2)
-      chunkHeader.writeUInt16LE(2, 32); // BlockAlign
-      chunkHeader.writeUInt16LE(16, 34); // BitsPerSample
-      chunkHeader.write('data', 36);
-      chunkHeader.writeUInt32LE(dataLen, 40);
-
-      const chunkWav = Buffer.concat([chunkHeader, chunkPcm]);
+      const chunkWav = Buffer.concat([createPcmWavHeader(chunkPcm.length), chunkPcm]);
       const chunkBase64 = chunkWav.toString('base64');
 
       chunks.push({
@@ -1398,6 +1423,217 @@ app.post('/api/model-advisor', async (req, res) => {
   }
 });
 
+// 9. Серверная нарезка больших файлов через прямую бинарную загрузку.
+// Клиент шлёт файл СЫРЫМ бинарным телом (Content-Type: application/octet-stream),
+// поэтому express.json/urlencoded его не трогают, а мы стримим тело сразу на диск —
+// файл никогда не поднимается целиком в память ни браузера, ни сервера.
+interface PrepareChunksJob {
+  dir: string;
+  totalChunks: number;
+  totalDuration: number;
+  chunkDurationSeconds: number;
+  timer: NodeJS.Timeout;
+}
+
+const prepareChunksJobs = new Map<string, PrepareChunksJob>();
+const PREPARE_CHUNKS_ROOT = path.join(os.tmpdir(), 'vibescribe-chunks');
+const PREPARE_JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 часа
+const FFMPEG_TIMEOUT_MS = 10 * 60 * 1000; // 10 минут
+const JOB_ID_PATTERN = /^job-\d+-[a-z0-9]+$/;
+
+// POST /api/prepare-chunks?chunkDurationSeconds=45
+app.post('/api/prepare-chunks', async (req, res) => {
+  const chunkDurationSeconds = Math.max(5, Math.min(600, Number(req.query.chunkDurationSeconds) || 45));
+  const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const jobDir = path.join(PREPARE_CHUNKS_ROOT, jobId);
+  const inputPath = path.join(jobDir, 'input.bin');
+  const outputPath = path.join(jobDir, 'output.wav');
+
+  const cleanupJobDir = () => {
+    fs.rm(jobDir, { recursive: true, force: true }, () => {});
+  };
+
+  try {
+    await fs.promises.mkdir(jobDir, { recursive: true });
+
+    // 1. Стримим сырое бинарное тело запроса напрямую во временный файл (без буферизации в память)
+    await new Promise<void>((resolve, reject) => {
+      const ws = fs.createWriteStream(inputPath);
+      req.pipe(ws);
+      req.on('error', reject);
+      ws.on('error', reject);
+      ws.on('finish', () => resolve());
+    });
+
+    const inputStats = await fs.promises.stat(inputPath);
+    if (inputStats.size === 0) {
+      cleanupJobDir();
+      res.status(400).json({ error: 'Пустое тело запроса: файл не был получен сервером.' });
+      return;
+    }
+
+    // 2. Транскодируем файл целиком в 16 кГц моно PCM WAV на ДИСКЕ через FFmpeg.
+    // Сознательно НЕ используем ensureClean16kWavBuffer (она держит весь файл в памяти).
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const ff = spawn('/usr/bin/ffmpeg', [
+          '-y',
+          '-i', inputPath,
+          '-vn',
+          '-ac', '1',
+          '-ar', '16000',
+          '-acodec', 'pcm_s16le',
+          outputPath,
+        ]);
+        let errOut = '';
+        const timer = setTimeout(() => {
+          ff.kill('SIGKILL');
+          reject(new Error('превышен таймаут обработки FFmpeg (10 минут)'));
+        }, FFMPEG_TIMEOUT_MS);
+        ff.stderr.on('data', (d) => {
+          errOut += d.toString();
+        });
+        ff.on('error', (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+        ff.on('close', (code) => {
+          clearTimeout(timer);
+          if (code === 0 && fs.existsSync(outputPath)) {
+            resolve();
+          } else {
+            reject(new Error(`FFmpeg завершился с кодом ${code}: ${errOut.slice(-200)}`));
+          }
+        });
+      });
+    } catch (ffErr: any) {
+      console.error('Prepare chunks FFmpeg error:', ffErr);
+      cleanupJobDir();
+      res.status(500).json({
+        error:
+          'Серверный FFmpeg недоступен или не смог обработать этот файл. ' +
+          'Убедитесь, что FFmpeg установлен на сервере (/usr/bin/ffmpeg), а файл содержит аудиодорожку. ' +
+          (ffErr?.message || String(ffErr)),
+      });
+      return;
+    }
+
+    // 3. Нарезаем полученный WAV на фрагменты по chunkDurationSeconds и складываем на диск
+    const sampleRate = 16000;
+    const bytesPerSample = 2; // 16-bit PCM mono
+    const wavBuffer = await fs.promises.readFile(outputPath);
+    const headerSize = findWavDataOffset(wavBuffer);
+    const pcmData = wavBuffer.subarray(headerSize);
+    const totalDuration = pcmData.length / bytesPerSample / sampleRate;
+    const bytesPerChunk = Math.floor(chunkDurationSeconds * sampleRate) * bytesPerSample;
+    const totalChunks = Math.max(1, Math.ceil(pcmData.length / bytesPerChunk));
+
+    for (let i = 0; i < totalChunks; i++) {
+      const startByte = i * bytesPerChunk;
+      const endByte = Math.min(pcmData.length, startByte + bytesPerChunk);
+      const chunkPcm = pcmData.subarray(startByte, endByte);
+      const chunkWav = Buffer.concat([createPcmWavHeader(chunkPcm.length), chunkPcm]);
+      await fs.promises.writeFile(path.join(jobDir, `chunk_${i}.wav`), chunkWav);
+    }
+
+    // 4. Тяжёлые промежуточные файлы больше не нужны
+    await fs.promises.unlink(inputPath).catch(() => {});
+    await fs.promises.unlink(outputPath).catch(() => {});
+
+    // 5. Регистрируем задание с TTL: через 2 часа каталог удаляется автоматически
+    const timer = setTimeout(() => {
+      prepareChunksJobs.delete(jobId);
+      fs.rm(jobDir, { recursive: true, force: true }, () => {});
+    }, PREPARE_JOB_TTL_MS);
+    timer.unref?.();
+    prepareChunksJobs.set(jobId, {
+      dir: jobDir,
+      totalChunks,
+      totalDuration: +totalDuration.toFixed(2),
+      chunkDurationSeconds,
+      timer,
+    });
+
+    res.json({
+      success: true,
+      jobId,
+      totalDuration: +totalDuration.toFixed(2),
+      totalChunks,
+      chunkDurationSeconds,
+    });
+  } catch (err: any) {
+    console.error('Prepare chunks error:', err);
+    cleanupJobDir();
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Ошибка серверной нарезки файла: ' + (err.message || 'Неизвестная ошибка сервера'),
+      });
+    }
+  }
+});
+
+// GET /api/prepare-chunks/:jobId/:index — отдать один фрагмент с диска
+app.get('/api/prepare-chunks/:jobId/:index', async (req, res) => {
+  try {
+    const { jobId, index } = req.params;
+    if (!JOB_ID_PATTERN.test(jobId)) {
+      res.status(400).json({ error: 'Некорректный идентификатор задания нарезки.' });
+      return;
+    }
+
+    const job = prepareChunksJobs.get(jobId);
+    if (!job) {
+      res.status(410).json({
+        error: 'Задание нарезки не найдено или срок его хранения истёк (2 часа). Загрузите файл заново.',
+      });
+      return;
+    }
+
+    const chunkIndex = parseInt(index, 10);
+    const chunkPath = path.join(job.dir, `chunk_${chunkIndex}.wav`);
+    if (
+      !Number.isInteger(chunkIndex) ||
+      chunkIndex < 0 ||
+      chunkIndex >= job.totalChunks ||
+      !fs.existsSync(chunkPath)
+    ) {
+      res.status(404).json({
+        error: `Фрагмент ${index} не найден (всего фрагментов в задании: ${job.totalChunks}).`,
+      });
+      return;
+    }
+
+    const chunkBuffer = await fs.promises.readFile(chunkPath);
+    const dataOffset = findWavDataOffset(chunkBuffer);
+    const duration = (chunkBuffer.length - dataOffset) / 2 / 16000;
+
+    res.json({
+      index: chunkIndex,
+      totalChunks: job.totalChunks,
+      startTime: +(chunkIndex * job.chunkDurationSeconds).toFixed(2),
+      duration: +duration.toFixed(2),
+      audioBase64: `data:audio/wav;base64,${chunkBuffer.toString('base64')}`,
+    });
+  } catch (err: any) {
+    console.error('Get prepared chunk error:', err);
+    res.status(500).json({ error: 'Ошибка чтения фрагмента: ' + (err.message || 'Неизвестная ошибка') });
+  }
+});
+
+// DELETE /api/prepare-chunks/:jobId — удалить временные файлы задания
+app.delete('/api/prepare-chunks/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const job = prepareChunksJobs.get(jobId);
+  if (job) {
+    clearTimeout(job.timer);
+    prepareChunksJobs.delete(jobId);
+  }
+  if (JOB_ID_PATTERN.test(jobId)) {
+    fs.rm(path.join(PREPARE_CHUNKS_ROOT, jobId), { recursive: true, force: true }, () => {});
+  }
+  res.json({ success: true });
+});
+
 // Vite frontend integration (development vs production)
 async function setupVite() {
   const isProd = process.env.NODE_ENV === 'production';
@@ -1419,7 +1655,6 @@ async function setupVite() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
-}
 
 setupVite().catch((err) => {
   console.error('Failed to start server:', err);
