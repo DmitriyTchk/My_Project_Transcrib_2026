@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { spawn } from 'child_process';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -30,6 +31,50 @@ const LOCAL_WHISPER_API_KEY = process.env.LOCAL_WHISPER_API_KEY || '';
 app.use(express.json({ limit: '250mb' }));
 app.use(express.urlencoded({ limit: '250mb', extended: true }));
 
+// --- Опциональная HTTP Basic авторизация ---
+// APP_USER — логин (по умолчанию 'admin').
+// APP_PASSWORD — пароль; если пустой, авторизация ВЫКЛЮЧЕНА и локальная работа не меняется.
+const AUTH_USER = process.env.APP_USER || 'admin';
+const AUTH_PASSWORD = process.env.APP_PASSWORD || '';
+
+if (AUTH_PASSWORD) {
+  console.log(`[auth] HTTP Basic авторизация включена (пользователь: "${AUTH_USER}")`);
+  app.use((req, res, next) => {
+    // Healthcheck всегда открыт (для docker/monitoring)
+    if (req.method === 'GET' && req.path === '/api/health') return next();
+
+    const header = req.headers.authorization || '';
+    if (header.startsWith('Basic ')) {
+      let decoded = '';
+      try {
+        decoded = Buffer.from(header.slice(6), 'base64').toString('utf-8');
+      } catch {
+        decoded = '';
+      }
+      const sep = decoded.indexOf(':');
+      const user = sep >= 0 ? decoded.slice(0, sep) : '';
+      const pass = sep >= 0 ? decoded.slice(sep + 1) : '';
+      // Сравнение через timingSafeEqual (защита от тайминг-атак);
+      // при разной длине буферов timingSafeEqual бросает исключение — поэтому сначала проверяем длину.
+      const expectedUser = Buffer.from(AUTH_USER, 'utf-8');
+      const expectedPass = Buffer.from(AUTH_PASSWORD, 'utf-8');
+      const actualUser = Buffer.from(user, 'utf-8');
+      const actualPass = Buffer.from(pass, 'utf-8');
+      const userOk =
+        actualUser.length === expectedUser.length &&
+        crypto.timingSafeEqual(actualUser, expectedUser);
+      const passOk =
+        actualPass.length === expectedPass.length &&
+        crypto.timingSafeEqual(actualPass, expectedPass);
+      if (userOk && passOk) return next();
+    }
+
+    // Браузер покажет нативный диалог логина/пароля
+    res.set('WWW-Authenticate', 'Basic realm="VibeScribe Studio", charset="UTF-8"');
+    res.status(401).send('Требуется авторизация');
+  });
+}
+
 // In-memory session secrets storage (session ID -> provider -> apiKey)
 // Keys are never sent back to the client plain text
 const sessionSecrets = new Map<string, Record<string, string>>();
@@ -55,6 +100,7 @@ app.get('/api/health', (req, res) => {
     hasGroqKey: !!process.env.GROQ_API_KEY,
     hasOpenAIKey: !!process.env.OPENAI_API_KEY,
     hasDeepgramKey: !!process.env.DEEPGRAM_API_KEY,
+    authEnabled: !!process.env.APP_PASSWORD,
     timestamp: new Date().toISOString(),
   });
 });
