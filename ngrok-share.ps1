@@ -48,7 +48,7 @@ $SMTP_PORT = [int](Get-ConfigValue 'SMTP_PORT' '587')
 $SMTP_USER = Get-ConfigValue 'SMTP_USER'
 $SMTP_PASS = Get-ConfigValue 'SMTP_PASS'
 $SMTP_TO   = Get-ConfigValue 'SMTP_TO'
-$NGROK_PORT = Get-ConfigValue 'NGROK_PORT' '8000'
+$NGROK_PORT = Get-ConfigValue 'NGROK_PORT' '3000'
 
 # --- Получение публичного URL из локального API ngrok ---
 function Get-NgrokPublicUrl {

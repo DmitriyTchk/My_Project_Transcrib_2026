@@ -40,9 +40,20 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
   // Audio recording & volume meter
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
+  // Движок распознавания диктанта: локальный Whisper (приватно) по умолчанию
+  // или «живой текст» браузера (Web Speech API = облако Google)
+  const [engine, setEngine] = useState<'local' | 'webspeech'>(() => {
+    try {
+      const saved = localStorage.getItem('vibescribe_dictation_engine');
+      return saved === 'webspeech' ? 'webspeech' : 'local';
+    } catch {
+      return 'local';
+    }
+  });
   const [backendType, setBackendType] = useState<
-    'webspeech' | 'cloud-chunked' | 'unsupported'
-  >('webspeech');
+    'webspeech' | 'local-whisper' | 'unsupported'
+  >('local-whisper');
+  const [dictationError, setDictationError] = useState<string>('');
 
   const recognitionRef = useRef<any>(null);
   const timerRef = useRef<any>(null);
@@ -51,19 +62,30 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
+  const chunkTimerRef = useRef<any>(null);
+  const isRecordingRef = useRef(false);
+  const isPausedRef = useRef(false);
+  const chunkFailuresRef = useRef(0);
 
-  // Check Web Speech API support
+  // Сохраняем выбранный движок диктанта
+  useEffect(() => {
+    try {
+      localStorage.setItem('vibescribe_dictation_engine', engine);
+    } catch {}
+  }, [engine]);
+
+  // Check Web Speech API support (нужен только для режима «Живой текст браузера»)
   useEffect(() => {
     const SpeechRecognition =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
 
-    if (SpeechRecognition) {
+    if (engine === 'webspeech' && SpeechRecognition) {
       setBackendType('webspeech');
     } else {
-      setBackendType('cloud-chunked');
+      setBackendType('local-whisper');
     }
-  }, []);
+  }, [engine]);
 
   // Timer counter
   useEffect(() => {
@@ -124,8 +146,82 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
     setAudioLevel(0);
   };
 
+  // Отправка одного аудиофрагмента на локальный Whisper через сервер
+  const sendChunkToServer = async (blob: Blob) => {
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64 = reader.result as string;
+      try {
+        const res = await fetch('/api/dictate-chunk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            audioBase64: base64,
+            mimeType: blob.type || 'audio/webm',
+            language: selectedLanguage.split('-')[0],
+            autoPunctuation,
+          }),
+        });
+        if (res.ok) {
+          chunkFailuresRef.current = 0;
+          const data = await res.json();
+          if (data.text) {
+            setFinalTranscript((prev) => (prev ? prev + ' ' : '') + data.text);
+          }
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Сервер вернул ошибку (HTTP ${res.status})`);
+        }
+      } catch (err: any) {
+        console.error('Dictate chunk error:', err);
+        chunkFailuresRef.current += 1;
+        setDictationError(err.message || 'Ошибка распознавания фрагмента');
+        // Если 3 подряд фрагмента не распознались — останавливаем запись
+        if (chunkFailuresRef.current >= 3) {
+          stopRecording();
+          setDictationError(
+            'Запись остановлена: локальный сервер распознавания не отвечает (3 ошибки подряд). Проверьте, что faster-whisper-server запущен.'
+          );
+        }
+      }
+    };
+    reader.readAsDataURL(blob);
+  };
+
+  // Цикл записи: каждые 4 секунды формируем ПОЛНЫЙ файл (stop/start),
+  // чтобы каждый фрагмент был самостоятельно декодируемым для Whisper
+  const startChunkCycle = () => {
+    const mr = mediaRecorderRef.current;
+    if (!mr || mr.state !== 'inactive') return;
+    if (!isRecordingRef.current || isPausedRef.current) return;
+    audioChunksRef.current = [];
+    try {
+      mr.start();
+    } catch {
+      return;
+    }
+    chunkTimerRef.current = setTimeout(() => {
+      try {
+        if (mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
+    }, 4000);
+  };
+
   // Start Recognition Flow
   const startRecording = async () => {
+    // Проверка безопасного контекста: getUserMedia недоступен по HTTP по IP-адресу
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setDictationError(
+        'Доступ к микрофону возможен только по HTTPS или http://localhost:3000. Откройте приложение по защищённому адресу (например, через ngrok-туннель) или по localhost.'
+      );
+      return;
+    }
+
+    setDictationError('');
+    chunkFailuresRef.current = 0;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       await startAudioMeter(stream);
@@ -134,7 +230,10 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         (window as any).SpeechRecognition ||
         (window as any).webkitSpeechRecognition;
 
-      if (SpeechRecognition) {
+      isRecordingRef.current = true;
+      isPausedRef.current = false;
+
+      if (engine === 'webspeech' && SpeechRecognition) {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
         recognition.interimResults = true;
@@ -162,7 +261,7 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
 
         recognition.onend = () => {
           // Restart if still in active recording state
-          if (isRecording && !isPaused && recognitionRef.current) {
+          if (isRecordingRef.current && !isPausedRef.current && recognitionRef.current) {
             try {
               recognitionRef.current.start();
             } catch {}
@@ -172,50 +271,39 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         recognition.start();
         recognitionRef.current = recognition;
       } else {
-        // Fallback to MediaRecorder + slice chunking
+        // Локальный Whisper: MediaRecorder + отправка фрагментов на /api/dictate-chunk
         const mediaRecorder = new MediaRecorder(stream);
         mediaRecorderRef.current = mediaRecorder;
         audioChunksRef.current = [];
 
-        mediaRecorder.ondataavailable = async (e) => {
+        mediaRecorder.ondataavailable = (e) => {
           if (e.data.size > 0) {
             audioChunksRef.current.push(e.data);
-            // Process chunk via server
-            const blob = new Blob([e.data], { type: 'audio/webm' });
-            const reader = new FileReader();
-            reader.onload = async () => {
-              const base64 = reader.result as string;
-              try {
-                const res = await fetch('/api/dictate-chunk', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    audioBase64: base64,
-                    language: selectedLanguage.split('-')[0],
-                    autoPunctuation,
-                  }),
-                });
-                if (res.ok) {
-                  const data = await res.json();
-                  if (data.text) {
-                    setFinalTranscript((prev) => (prev ? prev + ' ' : '') + data.text);
-                  }
-                }
-              } catch (err) {
-                console.error('Dictate chunk error:', err);
-              }
-            };
-            reader.readAsDataURL(blob);
           }
         };
 
-        mediaRecorder.start(4000); // 4-second slices
+        mediaRecorder.onstop = () => {
+          const chunks = audioChunksRef.current;
+          if (chunks.length > 0) {
+            // Передаём реальный mimeType фрагмента
+            const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+            sendChunkToServer(blob);
+          }
+          // Перезапускаем цикл, если запись всё ещё активна
+          if (isRecordingRef.current && !isPausedRef.current) {
+            startChunkCycle();
+          }
+        };
+
+        startChunkCycle();
       }
 
       setIsRecording(true);
       setIsPaused(false);
     } catch (err: any) {
-      alert('Не удалось получить доступ к микрофону: ' + err.message);
+      isRecordingRef.current = false;
+      isPausedRef.current = false;
+      setDictationError('Не удалось получить доступ к микрофону: ' + err.message);
     }
   };
 
@@ -225,8 +313,16 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         recognitionRef.current.stop();
       } catch {}
     }
+    isPausedRef.current = true;
+    if (chunkTimerRef.current) {
+      clearTimeout(chunkTimerRef.current);
+      chunkTimerRef.current = null;
+    }
+    // Останавливаем текущий фрагмент: onstop отправит его, но не начнёт новый цикл
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.pause();
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {}
     }
     setIsPaused(true);
   };
@@ -237,13 +333,21 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         recognitionRef.current.start();
       } catch {}
     }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
-      mediaRecorderRef.current.resume();
+    isPausedRef.current = false;
+    // Запускаем новый цикл записи фрагментов
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
+      startChunkCycle();
     }
     setIsPaused(false);
   };
 
   const stopRecording = () => {
+    isRecordingRef.current = false;
+    isPausedRef.current = false;
+    if (chunkTimerRef.current) {
+      clearTimeout(chunkTimerRef.current);
+      chunkTimerRef.current = null;
+    }
     if (recognitionRef.current) {
       try {
         recognitionRef.current.stop();
@@ -252,7 +356,9 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
     }
     if (mediaRecorderRef.current) {
       try {
-        mediaRecorderRef.current.stop();
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
       } catch {}
       mediaRecorderRef.current = null;
     }
@@ -288,9 +394,9 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
       language: selectedLanguage.split('-')[0],
       detectedLanguage: selectedLanguage.split('-')[0],
       languageName: selectedLanguage === 'ru-RU' ? 'Русский' : 'English',
-      modelId: 'gemini-3.7-flash',
-      modelName: 'Живой Голосовой Диктант',
-      engineMode: 'cloud',
+      modelId: engine === 'local' ? 'faster-whisper-large-v3' : 'webspeech-browser',
+      modelName: engine === 'local' ? 'Локальный Whisper (Диктант)' : 'Живой Голосовой Диктант',
+      engineMode: engine === 'local' ? 'local' : 'cloud',
       createdAt: new Date().toISOString(),
       fullText: text,
       segments: [
@@ -343,13 +449,25 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
             <span>
               {backendType === 'webspeech'
                 ? 'Web Speech Streaming (Реальное время)'
-                : 'Cloud Slices ASR (Пакетный)'}
+                : 'Локальный Whisper (Пакетный)'}
             </span>
           </div>
         </div>
 
         {/* Options */}
         <div className="flex items-center gap-3">
+          {/* Dictation Engine Selector */}
+          <select
+            value={engine}
+            onChange={(e) => setEngine(e.target.value as 'local' | 'webspeech')}
+            disabled={isRecording}
+            className="px-2.5 py-1 text-xs rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100"
+            title="Движок распознавания диктанта"
+          >
+            <option value="local">Локальный Whisper (приватно)</option>
+            <option value="webspeech">Живой текст браузера (Google)</option>
+          </select>
+
           {/* Language Selector */}
           <select
             value={selectedLanguage}
@@ -376,6 +494,20 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Error / Status notification */}
+      {dictationError && (
+        <div className="flex items-start justify-between gap-3 p-3.5 rounded-xl border border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 text-xs leading-relaxed">
+          <span>{dictationError}</span>
+          <button
+            onClick={() => setDictationError('')}
+            className="shrink-0 px-2 py-0.5 rounded-md text-red-500 hover:text-red-700 dark:hover:text-red-200 font-semibold"
+            title="Скрыть сообщение"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Main Recording Center: Giant Finger-friendly Mic Button */}
       <div className="flex flex-col items-center justify-center p-8 rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-gradient-to-b from-white to-zinc-50 dark:from-zinc-900 dark:to-zinc-950 shadow-sm space-y-6">
