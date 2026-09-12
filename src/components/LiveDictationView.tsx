@@ -54,6 +54,19 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
     'webspeech' | 'local-whisper' | 'unsupported'
   >('local-whisper');
   const [dictationError, setDictationError] = useState<string>('');
+  // Показывать ли в баннере ошибки кнопку «Переключиться на локальный Whisper»
+  const [suggestLocalSwitch, setSuggestLocalSwitch] = useState(false);
+
+  // Показать ошибку диктанта в видимом баннере (с опциональным предложением сменить движок)
+  const showDictationError = (message: string, canSwitchToLocal = false) => {
+    setDictationError(message);
+    setSuggestLocalSwitch(canSwitchToLocal);
+  };
+
+  const clearDictationError = () => {
+    setDictationError('');
+    setSuggestLocalSwitch(false);
+  };
 
   const recognitionRef = useRef<any>(null);
   const timerRef = useRef<any>(null);
@@ -175,11 +188,11 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
       } catch (err: any) {
         console.error('Dictate chunk error:', err);
         chunkFailuresRef.current += 1;
-        setDictationError(err.message || 'Ошибка распознавания фрагмента');
+        showDictationError(err.message || 'Ошибка распознавания фрагмента');
         // Если 3 подряд фрагмента не распознались — останавливаем запись
         if (chunkFailuresRef.current >= 3) {
           stopRecording();
-          setDictationError(
+          showDictationError(
             'Запись остановлена: локальный сервер распознавания не отвечает (3 ошибки подряд). Проверьте, что faster-whisper-server запущен.'
           );
         }
@@ -211,30 +224,39 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
 
   // Start Recognition Flow
   const startRecording = async () => {
+    const SpeechRecognitionCtor =
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
+
+    // Режим «Живой текст браузера» выбран, но Web Speech API отсутствует
+    if (engine === 'webspeech' && !SpeechRecognitionCtor) {
+      showDictationError(
+        'Этот браузер не поддерживает живое распознавание (Web Speech API). Используйте Chrome или переключитесь на «Локальный Whisper».',
+        true
+      );
+      return;
+    }
+
     // Проверка безопасного контекста: getUserMedia недоступен по HTTP по IP-адресу
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setDictationError(
+      showDictationError(
         'Доступ к микрофону возможен только по HTTPS или http://localhost:3000. Откройте приложение по защищённому адресу (например, через ngrok-туннель) или по localhost.'
       );
       return;
     }
 
-    setDictationError('');
+    clearDictationError();
     chunkFailuresRef.current = 0;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       await startAudioMeter(stream);
 
-      const SpeechRecognition =
-        (window as any).SpeechRecognition ||
-        (window as any).webkitSpeechRecognition;
-
       isRecordingRef.current = true;
       isPausedRef.current = false;
 
-      if (engine === 'webspeech' && SpeechRecognition) {
-        const recognition = new SpeechRecognition();
+      if (engine === 'webspeech' && SpeechRecognitionCtor) {
+        const recognition = new SpeechRecognitionCtor();
         recognition.continuous = true;
         recognition.interimResults = true;
         recognition.lang = selectedLanguage;
@@ -256,7 +278,34 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         };
 
         recognition.onerror = (event: any) => {
-          console.warn('SpeechRecognition error:', event.error);
+          const code: string = event?.error || 'unknown';
+          console.warn('SpeechRecognition error:', code);
+
+          // 'no-speech' — просто не расслышал, не показываем как ошибку
+          if (code === 'no-speech') {
+            return;
+          }
+
+          // Фатальные коды: останавливаем запись и показываем понятный баннер,
+          // иначе цикл auto-restart в onend будет молча спамить ошибками
+          if (code === 'network') {
+            stopRecording();
+            showDictationError(
+              'Сервис распознавания Google недоступен (нет связи с серверами Google или они заблокированы сетью). Рекомендуется переключиться на «Локальный Whisper».',
+              true
+            );
+          } else if (code === 'not-allowed' || code === 'service-not-allowed') {
+            stopRecording();
+            showDictationError(
+              'Доступ к микрофону или к сервису распознавания запрещён браузером. Проверьте разрешение на микрофон для этого сайта.',
+              code === 'service-not-allowed'
+            );
+          } else if (code === 'audio-capture') {
+            stopRecording();
+            showDictationError('Микрофон не найден или занят другим приложением.');
+          } else {
+            showDictationError(`Ошибка распознавания браузера: ${code}`);
+          }
         };
 
         recognition.onend = () => {
@@ -303,7 +352,7 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
     } catch (err: any) {
       isRecordingRef.current = false;
       isPausedRef.current = false;
-      setDictationError('Не удалось получить доступ к микрофону: ' + err.message);
+      showDictationError('Не удалось получить доступ к микрофону: ' + err.message);
     }
   };
 
@@ -366,6 +415,13 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
     setIsRecording(false);
     setIsPaused(false);
     setInterimTranscript('');
+  };
+
+  // Корректно останавливаем запись и переключаемся на локальный Whisper
+  const switchToLocalEngine = () => {
+    stopRecording();
+    clearDictationError();
+    setEngine('local');
   };
 
   const copyToClipboard = () => {
@@ -457,16 +513,23 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         {/* Options */}
         <div className="flex items-center gap-3">
           {/* Dictation Engine Selector */}
-          <select
-            value={engine}
-            onChange={(e) => setEngine(e.target.value as 'local' | 'webspeech')}
-            disabled={isRecording}
-            className="px-2.5 py-1 text-xs rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100"
-            title="Движок распознавания диктанта"
-          >
-            <option value="local">Локальный Whisper (приватно)</option>
-            <option value="webspeech">Живой текст браузера (Google)</option>
-          </select>
+          <div className="flex flex-col gap-0.5">
+            <select
+              value={engine}
+              onChange={(e) => setEngine(e.target.value as 'local' | 'webspeech')}
+              disabled={isRecording}
+              className="px-2.5 py-1 text-xs rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100"
+              title="Движок распознавания диктанта"
+            >
+              <option value="local">Локальный Whisper (приватно)</option>
+              <option value="webspeech">Живой текст браузера (Google)</option>
+            </select>
+            {engine === 'webspeech' && (
+              <span className="text-xs text-zinc-400 dark:text-zinc-500">
+                ⚠️ Аудио отправляется на серверы Google
+              </span>
+            )}
+          </div>
 
           {/* Language Selector */}
           <select
@@ -498,9 +561,19 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
       {/* Error / Status notification */}
       {dictationError && (
         <div className="flex items-start justify-between gap-3 p-3.5 rounded-xl border border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 text-xs leading-relaxed">
-          <span>{dictationError}</span>
+          <div className="flex flex-col gap-2">
+            <span>{dictationError}</span>
+            {suggestLocalSwitch && (
+              <button
+                onClick={switchToLocalEngine}
+                className="self-start px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-800 bg-white dark:bg-red-900/40 text-red-700 dark:text-red-200 font-medium hover:bg-red-100 dark:hover:bg-red-900/70 transition-colors"
+              >
+                Переключиться на локальный Whisper
+              </button>
+            )}
+          </div>
           <button
-            onClick={() => setDictationError('')}
+            onClick={clearDictationError}
             className="shrink-0 px-2 py-0.5 rounded-md text-red-500 hover:text-red-700 dark:hover:text-red-200 font-semibold"
             title="Скрыть сообщение"
           >
