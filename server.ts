@@ -27,6 +27,15 @@ const LOCAL_WHISPER_ENDPOINT =
   process.env.LOCAL_WHISPER_ENDPOINT || 'http://localhost:8000/v1/audio/transcriptions';
 const LOCAL_WHISPER_API_KEY = process.env.LOCAL_WHISPER_API_KEY || '';
 
+// Надёжно отрезает data-URI префикс любой сложности от base64-строки.
+// Работает и для "data:audio/wav;base64,...", и для "data:audio/webm;codecs=opus;base64,..."
+// (простой regex /^data:[^;]+;base64,/ НЕ срабатывал на префиксах с codecs-параметром).
+function stripDataUriPrefix(value: string): string {
+  const str = String(value);
+  const commaIdx = str.indexOf(',');
+  return str.startsWith('data:') && commaIdx > 0 ? str.slice(commaIdx + 1) : str;
+}
+
 // Support large audio/video payloads (up to 250MB)
 app.use(express.json({ limit: '250mb' }));
 app.use(express.urlencoded({ limit: '250mb', extended: true }));
@@ -633,7 +642,7 @@ app.post('/api/transcribe', async (req, res) => {
       const effectiveLocalApiKey = localApiKey || LOCAL_WHISPER_API_KEY;
       try {
         // Срезаем возможный data-URI префикс (data:audio/...;base64,) перед декодированием
-        const cleanLocalBase64 = String(audioBase64).replace(/^data:[^;]+;base64,/, '');
+        const cleanLocalBase64 = stripDataUriPrefix(audioBase64);
         const buffer = Buffer.from(cleanLocalBase64, 'base64');
 
         const localResult = await transcribeViaLocalWhisper({
@@ -776,7 +785,7 @@ app.post('/api/transcribe', async (req, res) => {
 }`;
 
     // Inline audio data
-    const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
+    const cleanBase64 = stripDataUriPrefix(audioBase64);
 
     const audioPart = {
       inlineData: {
@@ -915,7 +924,7 @@ app.post('/api/transcribe-chunk', async (req, res) => {
       return;
     }
 
-    const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
+    const cleanBase64 = stripDataUriPrefix(audioBase64);
 
     // 1. Local Faster-Whisper GPU Engine (прямое локальное подключение; URL/ключ из клиента или из env)
     if (engineMode === 'local') {
@@ -1051,7 +1060,7 @@ app.post('/api/extract-audio-chunks', async (req, res) => {
       return;
     }
 
-    const cleanBase64 = fileBase64.replace(/^data:[^;]+;base64,/, '');
+    const cleanBase64 = stripDataUriPrefix(fileBase64);
     const inputBuffer = Buffer.from(cleanBase64, 'base64');
 
     // Transcode whole file/video to 16kHz mono WAV buffer via ffmpeg
@@ -1161,39 +1170,202 @@ app.post('/api/summarize-transcript', async (req, res) => {
   }
 });
 
+// Конвертация аудиофрагмента в 16 кГц моно WAV через серверный FFmpeg.
+// Паттерн переиспользован из /api/prepare-chunks: входной буфер пишется во временный файл,
+// FFmpeg читает его с диска (потоковый EBML из Chrome MediaRecorder без cues
+// PyAV/faster-whisper декодировать не может — поэтому конвертируем заранее).
+async function convertDictationChunkToWav(inputBuffer: Buffer, ext: string): Promise<Buffer> {
+  const jobId = crypto.randomUUID();
+  const inputPath = path.join(os.tmpdir(), `vibescribe-dict-${jobId}.${ext}`);
+  const outputPath = path.join(os.tmpdir(), `vibescribe-dict-${jobId}.wav`);
+
+  try {
+    await fs.promises.writeFile(inputPath, inputBuffer);
+
+    await new Promise<void>((resolve, reject) => {
+      const ff = spawn('/usr/bin/ffmpeg', [
+        '-y',
+        '-i', inputPath,
+        '-vn',
+        '-ac', '1',
+        '-ar', '16000',
+        '-acodec', 'pcm_s16le',
+        '-f', 'wav',
+        outputPath,
+      ]);
+      let errOut = '';
+      const timer = setTimeout(() => {
+        ff.kill('SIGKILL');
+        reject(new Error('превышен таймаут обработки FFmpeg (30 секунд)'));
+      }, 30000);
+      ff.stderr.on('data', (d) => {
+        errOut += d.toString();
+      });
+      ff.on('error', (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+      ff.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0 && fs.existsSync(outputPath)) {
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg завершился с кодом ${code}: ${errOut.slice(-200)}`));
+        }
+      });
+    });
+
+    return await fs.promises.readFile(outputPath);
+  } finally {
+    // Чистим временные файлы, чтобы не копился мусор в /tmp
+    fs.promises.unlink(inputPath).catch(() => {});
+    fs.promises.unlink(outputPath).catch(() => {});
+  }
+}
+
 // 5. Fast Dictation Chunk Endpoint (for streaming / live dictation slice)
+// Отправляет аудиофрагмент в локальный Whisper (OpenAI-совместимый /v1/audio/transcriptions)
 app.post('/api/dictate-chunk', async (req, res) => {
   try {
-    const { audioBase64, mimeType = 'audio/webm', language = 'ru', autoPunctuation = true } = req.body;
+    const { audioBase64, mimeType = 'audio/webm', language = 'ru', autoPunctuation = true, apiKey } = req.body;
 
     if (!audioBase64) {
       res.status(400).json({ error: 'Аудиофрагмент отсутствует' });
       return;
     }
 
-    const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
+    // Отрезаем data-URI префикс любой сложности (в т.ч. "data:audio/webm;codecs=opus;base64," от Chrome)
+    const cleanBase64 = stripDataUriPrefix(audioBase64);
+    const buffer = Buffer.from(cleanBase64, 'base64');
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.7-flash',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: mimeType,
-              data: cleanBase64,
-            },
-          },
-          {
-            text: `Точно распознай речь из этого короткого аудиофрагмента. Язык: ${language}. ${autoPunctuation ? 'Расставь знаки препинания.' : ''} Верни ТОЛЬКО распознанный текст без кавычек и лишних слов.`,
-          },
-        ],
-      },
-      config: {
-        temperature: 0.1,
-      },
-    });
+    // Определяем расширение файла из реального mimeType фрагмента
+    const mimeExtMap: Record<string, string> = {
+      'audio/webm': 'webm',
+      'video/webm': 'webm',
+      'audio/ogg': 'ogg',
+      'audio/opus': 'opus',
+      'audio/wav': 'wav',
+      'audio/x-wav': 'wav',
+      'audio/mp4': 'm4a',
+      'audio/m4a': 'm4a',
+      'audio/mpeg': 'mp3',
+      'audio/mp3': 'mp3',
+      'audio/flac': 'flac',
+      'audio/aac': 'aac',
+    };
+    const baseMime = String(mimeType || 'audio/webm').split(';')[0].trim().toLowerCase();
+    const ext = mimeExtMap[baseMime] || 'webm';
 
-    const recognizedText = response.text?.trim() || '';
+    // Конвертируем фрагмент в 16 кГц моно WAV: Chrome MediaRecorder отдаёт потоковый
+    // EBML (webm) без cues, который faster-whisper (PyAV) не может декодировать напрямую
+    let wavBuffer: Buffer;
+    try {
+      wavBuffer = await convertDictationChunkToWav(buffer, ext);
+    } catch (convErr: any) {
+      console.error('Dictation chunk ffmpeg convert error:', convErr?.message || convErr);
+      res.status(502).json({
+        error:
+          'Не удалось декодировать аудиофрагмент на сервере (FFmpeg). ' +
+          'Возможно, фрагмент повреждён или FFmpeg недоступен в контейнере. ' +
+          (convErr?.message || String(convErr)),
+      });
+      return;
+    }
+
+    // Нормализация языка до 2-буквенного кода
+    let langCode: string | undefined = undefined;
+    if (language && language !== 'auto') {
+      langCode = String(language).slice(0, 2).toLowerCase();
+    }
+
+    // Нормализация адреса локального сервера (как в /api/local-engine/test)
+    let rawUrl = LOCAL_WHISPER_ENDPOINT.trim();
+    let baseUrl = rawUrl;
+    try {
+      const parsed = new URL(rawUrl);
+      baseUrl = `${parsed.protocol}//${parsed.host}`;
+    } catch {}
+    const targetUrl = rawUrl.endsWith('/v1/audio/transcriptions')
+      ? rawUrl
+      : `${baseUrl}/v1/audio/transcriptions`;
+
+    const effectiveApiKey = apiKey || LOCAL_WHISPER_API_KEY;
+
+    const requestHeaders: Record<string, string> = {
+      'Bypass-Tunnel-Reminder': 'true',
+      'bypass-tunnel-reminder': 'true',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    };
+    if (effectiveApiKey) {
+      requestHeaders['Authorization'] = `Bearer ${effectiveApiKey}`;
+    }
+
+    // Кандидаты моделей по аналогии с /api/transcribe (getModelCandidates):
+    // на локальном faster-whisper-server физически загружена large-v3, сервер сматчит по факту
+    const modelCandidates = ['large-v3', 'Systran/faster-whisper-large-v3', 'whisper-1'];
+
+    let lastStatus = 500;
+    let lastErrorText = '';
+    let recognizedText: string | null = null;
+
+    for (const modelCandidate of modelCandidates) {
+      try {
+        const formData = new FormData();
+        const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+        formData.append('file', blob, 'chunk.wav');
+        formData.append('model', modelCandidate);
+        if (langCode) {
+          formData.append('language', langCode);
+        }
+        formData.append('response_format', 'json');
+        formData.append('temperature', '0');
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+        const whisperRes = await fetch(targetUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: formData,
+          signal: controller.signal,
+        }).catch((e) => {
+          clearTimeout(timeoutId);
+          throw e;
+        });
+
+        clearTimeout(timeoutId);
+        lastStatus = whisperRes.status;
+
+        if (whisperRes.ok) {
+          const data: any = await whisperRes.json();
+          recognizedText = (data.text || '').trim();
+          break;
+        }
+
+        lastErrorText = await whisperRes.text().catch(() => '');
+        // Модель не распознана сервером — пробуем следующего кандидата
+        if (![400, 404, 422].includes(whisperRes.status)) {
+          break;
+        }
+      } catch (fetchErr: any) {
+        // Сетевая ошибка или таймаут — локальный whisper недоступен
+        console.error('Dictation chunk whisper fetch error:', fetchErr?.message || fetchErr);
+        res.status(502).json({
+          error:
+            'Локальный сервер распознавания (Whisper) недоступен или не отвечает. Убедитесь, что контейнер faster-whisper-server запущен (порт 8000), и повторите попытку.',
+        });
+        return;
+      }
+    }
+
+    if (recognizedText === null) {
+      console.error('Dictation chunk whisper error:', lastStatus, lastErrorText.slice(0, 300));
+      res.status(502).json({
+        error: `Локальный Whisper вернул ошибку (HTTP ${lastStatus}). Проверьте, что сервер распознавания запущен и модель large-v3 загружена.`,
+      });
+      return;
+    }
+
     res.json({ text: recognizedText });
   } catch (err: any) {
     console.error('Dictation chunk error:', err);
