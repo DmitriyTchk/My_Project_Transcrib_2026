@@ -79,6 +79,9 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
   const isRecordingRef = useRef(false);
   const isPausedRef = useRef(false);
   const chunkFailuresRef = useRef(0);
+  // Сторожевой таймер «молчания» Web Speech API (Android Chrome может не шлать ни onresult, ни onerror)
+  const webspeechWatchdogRef = useRef<any>(null);
+  const gotAnyResultRef = useRef(false);
 
   // Сохраняем выбранный движок диктанта
   useEffect(() => {
@@ -262,6 +265,12 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         recognition.lang = selectedLanguage;
 
         recognition.onresult = (event: any) => {
+          // Любой результат = движок жив: сбрасываем сторожевой таймер «молчания»
+          gotAnyResultRef.current = true;
+          if (webspeechWatchdogRef.current) {
+            clearTimeout(webspeechWatchdogRef.current);
+            webspeechWatchdogRef.current = null;
+          }
           let interim = '';
           for (let i = event.resultIndex; i < event.results.length; i++) {
             const transcript = event.results[i][0].transcript;
@@ -319,6 +328,30 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
 
         recognition.start();
         recognitionRef.current = recognition;
+
+        // Сторожевой таймер «молчания»: Android Chrome может молча крутить
+        // SpeechRecognition без onresult и без onerror — показываем баннер.
+        // Таймер живёт от старта записи до первого onresult / остановки / паузы;
+        // auto-restart в onend на него не влияет.
+        gotAnyResultRef.current = false;
+        if (webspeechWatchdogRef.current) {
+          clearTimeout(webspeechWatchdogRef.current);
+        }
+        webspeechWatchdogRef.current = setTimeout(() => {
+          webspeechWatchdogRef.current = null;
+          if (
+            isRecordingRef.current &&
+            !isPausedRef.current &&
+            engine === 'webspeech' &&
+            !gotAnyResultRef.current
+          ) {
+            stopRecording();
+            showDictationError(
+              'Живое распознавание не отвечает: браузер молчит уже 8 секунд. Вероятно, сервис Google недоступен с этого устройства или из этой сети.',
+              true
+            );
+          }
+        }, 8000);
       } else {
         // Локальный Whisper: MediaRecorder + отправка фрагментов на /api/dictate-chunk
         const mediaRecorder = new MediaRecorder(stream);
@@ -362,6 +395,11 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
         recognitionRef.current.stop();
       } catch {}
     }
+    // На паузе сторожевой таймер «молчания» не должен срабатывать
+    if (webspeechWatchdogRef.current) {
+      clearTimeout(webspeechWatchdogRef.current);
+      webspeechWatchdogRef.current = null;
+    }
     isPausedRef.current = true;
     if (chunkTimerRef.current) {
       clearTimeout(chunkTimerRef.current);
@@ -393,6 +431,10 @@ export const LiveDictationView: React.FC<LiveDictationViewProps> = ({
   const stopRecording = () => {
     isRecordingRef.current = false;
     isPausedRef.current = false;
+    if (webspeechWatchdogRef.current) {
+      clearTimeout(webspeechWatchdogRef.current);
+      webspeechWatchdogRef.current = null;
+    }
     if (chunkTimerRef.current) {
       clearTimeout(chunkTimerRef.current);
       chunkTimerRef.current = null;
