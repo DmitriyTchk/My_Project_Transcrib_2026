@@ -36,6 +36,23 @@ function stripDataUriPrefix(value: string): string {
   return str.startsWith('data:') && commaIdx > 0 ? str.slice(commaIdx + 1) : str;
 }
 
+// Этап 8: если клиент прислал адрес localhost/127.0.0.1/[::1] (или ничего), а на сервере
+// настроен LOCAL_WHISPER_ENDPOINT (например, http://whisper:8000 внутри Docker-сети) —
+// используем СЕРВЕРНЫЙ адрес: «localhost» у клиента (телефон/другой ПК) и у сервера
+// в контейнере означает разные машины. Внешние адреса от клиента уважаем как есть.
+function resolveWhisperEndpoint(clientValue?: string): string {
+  const serverDefault = LOCAL_WHISPER_ENDPOINT.trim();
+  const value = (clientValue || '').trim();
+  if (!value) return serverDefault;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') {
+      return serverDefault;
+    }
+  } catch {}
+  return value;
+}
+
 // Support large audio/video payloads (up to 250MB)
 app.use(express.json({ limit: '250mb' }));
 app.use(express.urlencoded({ limit: '250mb', extended: true }));
@@ -172,7 +189,7 @@ app.post('/api/secrets/save', (req, res) => {
 // 3. Test Local Backend Endpoint
 app.post('/api/local-engine/test', async (req, res) => {
   const { endpoint, apiKey } = req.body;
-  let rawUrl = (endpoint || LOCAL_WHISPER_ENDPOINT).trim();
+  let rawUrl = resolveWhisperEndpoint(endpoint);
   const effectiveApiKey = apiKey || LOCAL_WHISPER_API_KEY;
 
   // Normalize URL: extract base host
@@ -638,7 +655,7 @@ app.post('/api/transcribe', async (req, res) => {
 
     // Handle Local mode proxy (прямое локальное подключение; URL/ключ из клиента или из env)
     if (engineMode === 'local') {
-      const effectiveEndpoint = (customEndpoint || LOCAL_WHISPER_ENDPOINT).trim();
+      const effectiveEndpoint = resolveWhisperEndpoint(customEndpoint);
       const effectiveLocalApiKey = localApiKey || LOCAL_WHISPER_API_KEY;
       try {
         // Срезаем возможный data-URI префикс (data:audio/...;base64,) перед декодированием
@@ -928,7 +945,7 @@ app.post('/api/transcribe-chunk', async (req, res) => {
 
     // 1. Local Faster-Whisper GPU Engine (прямое локальное подключение; URL/ключ из клиента или из env)
     if (engineMode === 'local') {
-      const effectiveEndpoint = (customEndpoint || LOCAL_WHISPER_ENDPOINT).trim();
+      const effectiveEndpoint = resolveWhisperEndpoint(customEndpoint);
       const effectiveLocalApiKey = localApiKey || LOCAL_WHISPER_API_KEY;
       try {
         const buffer = Buffer.from(cleanBase64, 'base64');
